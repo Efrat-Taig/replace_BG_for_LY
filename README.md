@@ -24,6 +24,19 @@ The pipeline consists of five main stages that work together to produce high-qua
 ```
 
 
+
+📢 Important Note
+
+This pipeline consists of multiple interconnected components. To make it easier to understand, I have provided both detailed explanations and code snippets for key parts of the process.
+
+While I cannot share the exact API implementation of our production pipeline (as it is deeply integrated into our internal system), I have extracted and structured the relevant logic for you. These include standalone code snippets to illustrate each stage of the process.
+
+Additionally, I have included the full pipeline code in the utils directory. However, this version is part of a larger system, which includes additional functionalities such as product placement and solid color background replacement. As a result, it may not be fully understandable in isolation. Nevertheless, I am providing it for transparency, and you are welcome to explore or use any relevant parts as needed.
+
+If you require additional components or clarifications, please feel free to reach out. My goal is to provide clear and useful information without unnecessary complexity.
+
+
+
 ## 📌 **Pipeline Stages**
 
 ### 1️⃣ **Background Removal**
