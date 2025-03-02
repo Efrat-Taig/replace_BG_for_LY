@@ -1,4 +1,4 @@
-## 3️⃣ Prompt Enhancement
+## Prompt Enhancement
 
 This optional component uses an LLM-based system to refine the user's text prompt for better background generation results.
 
