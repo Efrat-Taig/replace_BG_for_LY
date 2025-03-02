@@ -1,4 +1,4 @@
-## 4️⃣ Background Generation & Compositing: Post-Processing
+## Background Generation & Compositing: Post-Processing
 
 As part of the final stage of the pipeline, this component handles the crucial post-processing steps after background generation.
 
