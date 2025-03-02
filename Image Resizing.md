@@ -1,4 +1,4 @@
-## 2️⃣ Image Resizing for AI Models
+## Image Resizing for AI Models
 
 This component resizes the input image to dimensions optimized for AI image processing models.
 
