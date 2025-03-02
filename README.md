@@ -24,7 +24,6 @@ The pipeline consists of five main stages that work together to produce high-qua
 ```
 
 
-
 📢 Important Note
 
 This pipeline consists of multiple interconnected components. To make it easier to understand, I have provided both detailed explanations and code snippets for key parts of the process.
