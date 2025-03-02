@@ -1,0 +1,1108 @@
+import random, uuid, time
+import concurrent.futures, threading
+from math import ceil
+import numpy as np, cv2
+import requests, sentry_sdk
+from typing import Dict, List, Optional, Tuple, Union, NewType, Literal
+from PIL import Image, ImageColor
+from PIL.Image import Image as ImageType
+from PIL.ImageOps import invert
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from werkzeug.exceptions import BadRequest
+from connectors.databases.research import Research
+from core.s3_bucket_name import S3BucketName
+from core.env import Env, Environment
+
+from services.api_common.pipeline_api_input import PipelineApiInput
+from services.api_common.response import get_path_to_save_sid_image, upload_image_to_s3, change_url_to_presigned
+from services.api_common.settings import s3
+from services.common.agent.main import post_image_generation
+from services.common.algos.pipeline_algo import VisualLogLevel
+from services.common.algos.remove_bg.remove_bg_mask import RemoveBgMask
+from services.common.algos.replace_bg_inference import ReplaceBGInference, StableDiffusionInpaintAlgos
+from services.common.algos.remove_bg.remove_background_alg import RemoveBackgroundBiRefNet, RemoveBackgroundISNet
+from services.common.api.helpers import add_image_watermark
+from services.common.api.models.config import auth_headers
+from services.common.decorators import log_time, sentry_child_metric_operation, retry
+from services.common.pipeline.functions import get_image, boot_vdr
+from services.common.pipeline.remove_background import RemoveBackgroundPipeline
+from services.common.inference_requests.lmm_inference.lmm_pipelines import replace_bg_prompt_refinement
+from services.common.helpers.image_helpers import download_image_url
+from services.common.helpers.image_helpers import resize_image_by_bounding_box, crop_around_object
+from services.common.helpers.api_url_builder import service_api_url, ServiceNames
+from services.common.helpers.search.prompt_engineering import avoid_celeb_names
+from services.common.helpers.ethics_verification import verify_generate_query
+from services.common.helpers.file_io import get_image_from_input
+
+TEXT_TO_IMAGE_MAX_SIZE = 1024
+AWS_S3_KEY_LENGTH_LIMIT = 1024
+REF_IMAGE_SIZE = (224, 224)
+FOLDER_SIZE_LIMIT = AWS_S3_KEY_LENGTH_LIMIT - 32
+DEFAULT_INITIAL_GREEN_BG_PROMPT = "on a solid green background, with shadows and reflections"
+RES_FILE_EXTENSION = "PNG"
+MODEL_VERSION = "2.3"
+
+ImageSizeType = NewType("ImageSizeType", Tuple[int, int])
+research_db = Research()
+from enum import Enum
+class ReplaceBGPlacementType(str,Enum): # placement is where to put the foreground image on the new, replaced background
+    AUTOMATIC = "automatic"
+    MANUAL_PLACEMENT = "manual_placement"
+    ORIGINAL = "original" 
+    MANUAL_PADDING = "manual_padding" # Use padding to provide an exact place the foreground will be in the new image
+
+class Placement:
+    def __init__(self, x1, y1, x2, y2):
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+
+class ReplaceBGPlacementsLocation(Enum):
+    UPPER_LEFT = Placement(1/6, 1/6, 3/6, 3/6)
+    UPPER_RIGHT = Placement(3/6, 1/6, 5/6, 3/6)
+    BOTTOM_LEFT = Placement(1/6, 3/6, 3/6, 5/6)
+    BOTTOM_RIGHT = Placement(3/6, 3/6, 5/6, 5/6)
+    RIGHT_CENTER = Placement(3/6, 1/6, 5/6, 5/6)
+    LEFT_CENTER = Placement(1/6, 1/6, 3/6, 5/6)
+    UPPER_CENTER = Placement(1/6, 1/6, 5/6, 3/6)
+    BOTTOM_CENTER = Placement(1/6, 3/6, 5/6, 5/6)
+    CENTER_VERTICAL = Placement(2/6, 1/6, 4/6, 5/6)
+    CENTER_HORIZONTAL = Placement(1/6, 2/6, 5/6, 4/6)
+
+
+class ReplaceBGPlacements(str,Enum):
+    UPPER_LEFT = "upper_left"
+    UPPER_RIGHT = "upper_right"
+    BOTTOM_LEFT = "bottom_left"
+    BOTTOM_RIGHT = "bottom_right"
+    RIGHT_CENTER = "right_center"
+    LEFT_CENTER = "left_center"
+    UPPER_CENTER = "upper_center"
+    BOTTOM_CENTER = "bottom_center"
+    CENTER_VERTICAL = "center_vertical"
+    CENTER_HORIZONTAL = "center_horizontal"
+
+class ReplaceBGInputBase(BaseModel):
+    image_url: Optional[str] = Field(default=None) # for the start of the isolated route
+    file: Optional[str] = Field(default=None) # for the start of the isolated route
+    visual_url: Optional[str] = Field(default=None) # only in vhash-vdr case
+    sid: Optional[str] = Field(default=None) # only in vhash-vdr case
+    initial_green_bg_prompt: Optional[str] = Field(default=DEFAULT_INITIAL_GREEN_BG_PROMPT, validate_default=False) 
+    num_results: int = Field(default=4, ge=1, le=12, validate_default=False)
+    seed: Optional[int] = Field(default=-1, validate_default=False)
+    placement_type: Optional[ReplaceBGPlacementType] = Field(default=ReplaceBGPlacementType.ORIGINAL, validate_default=False) 
+    manual_placement_size: Optional[Tuple[int,int]] = Field(default=None)
+    manual_placement_location: Optional[Tuple[int,int]] = Field(default=None)
+    manual_placement_selection: Union[ReplaceBGPlacements, List[ReplaceBGPlacements], None] = Field(default=ReplaceBGPlacements.UPPER_LEFT, validate_default=False)  
+    result_name_list: Optional[List] = Field(default=[])
+    padding_values: Optional[List[int]] = Field(default=[0,0,0,0], validate_default=False)   # [top, bottom, left, right]
+    disable_safety:Optional[bool] = Field(default=False)
+    allow_solid_bg:Optional[bool] = Field(default=True)
+    sync: Optional[bool] = Field(default=False)
+    session_uid: str = Field(default="", validate_default=True) 
+    nsfw_limit: Optional[bool] = Field(default=True)
+    rmbg_model_version: Optional[float] = Field(default=2.0, validate_default=False)
+    original_quality: Optional[Literal[True, False]] = Field(default=False)
+    ref_image_urls: Optional[Union[List[str],str]] = Field(default=None) 
+    ref_image_files: Optional[Union[List[str],str]] = Field(default=None) 
+    image_prompt_scale: Optional[float] = Field(default=1.0, validate_default=False)
+    fast: bool = Field(default=True, validate_default=True) 
+    steps_num: Optional[int] = Field(default=None, validate_default=True)
+
+    @field_validator("steps_num")
+    @classmethod
+    def validate_steps_num(cls, steps_num, info: ValidationInfo):
+        if info.data["fast"] == True:
+            if steps_num is None:
+                res = 12
+            elif steps_num >= 4 and steps_num <= 50:
+                res = steps_num
+            else:
+                raise ValueError(f"steps_num for {info.data['model_type']} must be between 4 and 50.")
+        else:
+            if steps_num is None:
+                res = 30 
+            elif steps_num >= 4 and steps_num <= 50:
+                res = steps_num
+            else:
+                raise ValueError(f"steps_num for {info.data['model_type']} must be between 4 and 50.")
+        return res
+
+    @field_validator("session_uid")
+    @classmethod
+    def validate_session_uid(cls, session_uid, info: ValidationInfo):
+        return session_uid if session_uid != "" else str(uuid.uuid4())
+
+    @field_validator("manual_placement_selection")
+    @classmethod
+    def validate_manual_placement_selection(cls, manual_placement_selection, info: ValidationInfo):
+        if not isinstance(manual_placement_selection, list):
+            return [manual_placement_selection] 
+        else:
+            return manual_placement_selection
+
+    @field_validator("fast")
+    @classmethod
+    def validate_fast(cls, fast, info: ValidationInfo):
+        if info.data["ref_image_urls"] or info.data["ref_image_files"]:
+            return True
+        else:
+            return fast
+
+
+class lifestyleShotByTextData(ReplaceBGInputBase):
+    scene_description: str = Field(..., min_length=1) # bg_prompt alias
+    optimize_description: Optional[bool] = Field(default=True) # refine_prompt alias
+    exclude_elements: Optional[str] = Field(default=None) # negative_prompt alias
+    shot_size:Optional[Tuple] = Field(default=(1000, 1000), validate_default=False) # canvas_size alias
+    sku: Optional[str] = Field(default=None)
+
+class lifestyleShotByImageData(ReplaceBGInputBase):
+    shot_size:Optional[Tuple] = Field(default=(1000, 1000), validate_default=False) # canvas_size alias
+    sku: Optional[str] = Field(default=None)
+
+
+class ReplaceBGInputConfig(ReplaceBGInputBase):
+    bg_prompt: str = Field(default=None)
+    negative_prompt: Optional[str] = Field(default=None)
+    canvas_size:Optional[Tuple] = Field(default=(1000, 1000), validate_default=False)  
+    refine_prompt:Optional[bool] = Field(default=True)
+        
+    @field_validator("bg_prompt")
+    @classmethod
+    def validate_bg_prompt(cls, bg_prompt, info: ValidationInfo):
+        if len(bg_prompt) == 0 :
+            if info.data["ref_image_urls"] is None and info.data["ref_image_files"] is None:
+                raise ValueError("bg_prompt must not be empty.")
+            else:
+                return " "
+        else:
+            return bg_prompt
+        
+    @field_validator("refine_prompt")
+    @classmethod
+    def validate_refine_prompt(cls, refine_prompt, info: ValidationInfo):
+        if info.data["ref_image_urls"] or info.data["ref_image_files"]:
+            return False
+        else:
+            return refine_prompt
+
+    
+def convert_lifestyle_by_text_to_replace_bg(lifestyle_data: lifestyleShotByTextData) -> ReplaceBGInputConfig:
+    lifestyle_dict = lifestyle_data.model_dump(exclude_none=False)
+    bg_prompt = lifestyle_dict.pop("scene_description")
+    lifestyle_dict["bg_prompt"] = bg_prompt
+    negative_prompt = lifestyle_dict.pop("exclude_elements")
+    lifestyle_dict["negative_prompt"] = negative_prompt
+    canvas_size = lifestyle_dict.pop("shot_size")
+    lifestyle_dict["canvas_size"] = canvas_size
+    refine_prompt = lifestyle_dict.pop("optimize_description")
+    lifestyle_dict["refine_prompt"] = refine_prompt
+    replace_bg_config = ReplaceBGInputConfig(**lifestyle_dict)
+    return replace_bg_config
+
+def convert_lifestyle_by_image_to_replace_bg(lifestyle_data: lifestyleShotByImageData) -> ReplaceBGInputConfig:
+    lifestyle_dict = lifestyle_data.model_dump(exclude_none=False)
+    lifestyle_dict["bg_prompt"] = ""
+    lifestyle_dict["negative_prompt"] = ""
+    canvas_size = lifestyle_dict.pop("shot_size")
+    lifestyle_dict["canvas_size"] = canvas_size
+    lifestyle_dict["refine_prompt"] = False
+    replace_bg_config = ReplaceBGInputConfig(**lifestyle_dict)
+    return replace_bg_config
+
+
+class ReplaceBG:
+    """
+    Remove background from image and harmonize it with generated images
+    Args:
+        input: PipelineApiInput
+        prompt: str
+        num_results: int
+        seed: int
+    Returns:
+        list of images
+    """
+
+    bucket_name = S3BucketName.BRIA_TEMP.value
+
+    @log_time()
+    @sentry_child_metric_operation
+    def __init__(
+        self,
+        api_token: str,
+        session_uid: Optional[str] = None,
+        input: Optional[PipelineApiInput] = None,
+        watermark_flag: bool = False,
+        img: Optional[ImageType] = None,
+    ):
+        if input is not None:
+            self.vdr_object, self.vdr = boot_vdr(input.visual_hash)
+            self.img = get_image(input, self.vdr_object)
+            self.vhash_or_uuid = self.vdr_object.visual_hash
+        elif img is not None: 
+            self.img = img
+            self.vhash_or_uuid = session_uid
+            self.vdr_object = None
+            self.vdr = None
+        else:
+            raise ValueError("Either input or img must be provided")
+        self.api_token = api_token
+        self.session_uid = session_uid
+        self.watermark_flag = watermark_flag
+        # debug code
+        # self.visual_dump = False 
+        # self.upload_image_for_debug_if_needed(self.img, str(input.sid), input)
+        # self.textual_dump = False
+        # self.upload_debug_data(input) 
+
+    # @log_time()
+    def _set_gen_image_size(
+        self, image: ImageType, res_size: int = TEXT_TO_IMAGE_MAX_SIZE
+    ) -> Tuple:
+        w, h = image.size
+        image_res = max(w, h)
+
+        total_pixel_number = res_size**2
+        ratio = w / h
+        new_width = int((total_pixel_number * ratio) ** 0.5)        
+        new_height = int(total_pixel_number / new_width)
+        orig_normalized_size = (new_width, new_height)
+        
+        # round to model granularity
+        IMAGE_SIZE_ROUND = ReplaceBGInference.IMAGE_SIZE_ROUND
+        new_height = ceil(new_height / IMAGE_SIZE_ROUND) * IMAGE_SIZE_ROUND
+        new_width = ceil(new_width / IMAGE_SIZE_ROUND) * IMAGE_SIZE_ROUND
+
+        gen_size: ImageSizeType = ImageSizeType((new_width, new_height))
+
+        # set the margin added to image size
+        margin_w = (gen_size[0] - orig_normalized_size[0]) // 2
+        margin_h = (gen_size[1] - orig_normalized_size[1]) // 2
+        margin = (margin_w, margin_h)
+
+        return gen_size, orig_normalized_size, margin
+
+
+    def _inpainting_post_process(self, gen_image: ImageType, orig_size_image: ImageType,fg_mask: ImageType, params,gen_mask=None,bg_color=None)-> ImageType:
+
+        # remove alpha, it has no use now in most cases and remove bg (and maybe inpainting as well) produces alpha noise we don't want in the result
+        gen_image = gen_image.convert("RGB")
+
+        margin = params["margin"]
+        orig_normalized_size = params["norm_size"]
+        gen_image = gen_image.crop((margin[0], margin[1], margin[0] + orig_normalized_size[0], margin[1] + orig_normalized_size[1]))
+        
+        if bg_color is not None:
+            gen_mask = gen_mask.crop((margin[0], margin[1], margin[0] + orig_normalized_size[0], margin[1] + orig_normalized_size[1]))
+            gen_image = self._adapt_color(gen_image, gen_mask, bg_color)
+
+        orig_size = orig_size_image.size
+
+        gen_image = gen_image.resize(orig_size,Image.LANCZOS)
+
+        if params["fg_paste_en"]:
+            fg_mask = fg_mask.resize(orig_size)
+            gen_image.paste(orig_size_image, fg_mask)
+
+        return gen_image
+
+    def _create_black_image(self, size):
+        result = Image.new("RGB", size, (0, 0, 0))
+        result_mask = Image.new("L", size, (0))
+        return result, result_mask
+
+
+    @log_time("_remove_bg")
+    @retry()
+    def _remove_bg(self, remove_bg_version:float)->Tuple[ImageType, ImageType]: # this is a subset of the remove bg pipeline, because here we need only the mask
+        if remove_bg_version == 1.4:
+            rmbg_mask = RemoveBgMask(matting_alg = RemoveBackgroundISNet())
+        else:
+            rmbg_mask = RemoveBgMask(matting_alg = RemoveBackgroundBiRefNet())
+        fg_mask :ImageType = rmbg_mask.get_rmbg_mask(
+        # fg_mask :ImageType = rmbg_mask.classify(
+                vdr_object=self.vdr_object,
+                vdr=self.vdr,
+                img=self.img,
+                use_mask_cache=(remove_bg_version == 2.0), # we don't want to use cache for the old version
+                use_alpha_channel=True
+            )
+        maksed_image = RemoveBackgroundPipeline.alpha_blend(self.img, fg_mask)
+        return maksed_image, fg_mask
+
+
+    @log_time("_remove_bg_isolated")
+    @retry()
+    def _remove_bg_isolated(self, image)->ImageType:
+        remove_bg_api_url = service_api_url(ServiceNames.REMOVE_BG.value)
+        url = f"{remove_bg_api_url}/background/remove"
+        tmp_rmbg_path = "/tmp/remove_bg_image.png"
+        image.save(tmp_rmbg_path)
+        files=[
+            ('file',('image_name.png',open(tmp_rmbg_path,'rb'),'image/png'))
+        ]
+        response = requests.request("POST", url, headers=auth_headers, data={}, files=files)        
+        remove_bg_res = response.json()
+        res_image = download_image_url(remove_bg_res["result_url"])
+        fg_mask = res_image.split()[-1]
+        return fg_mask
+
+
+    def _upload_empty_file(self, seed: int, folder_name: str = ""):
+        image_path = ReplaceBG.get_image_path(folder_name, seed)
+        file_name = '/tmp/myfile.txt'
+        with open(file_name, 'w') as fp:
+            s3.upload_file(
+                bucket = ReplaceBG.bucket_name, 
+                path_in_s3 = image_path,
+                path_to_local_file=file_name
+            )
+
+
+    def _upload_images(
+        self,
+        images_list: List[ImageType],
+        text: str,
+        seed: int,
+        folder_name: str = "",
+    ) -> None:
+        if len(images_list) == 1:
+            image_path = ReplaceBG.get_image_path(folder_name, seed)
+
+            s3.upload_image_png_optimized(
+                img=images_list[0],
+                bucket=ReplaceBG.bucket_name,
+                key=image_path,
+            )
+            return
+        for i, image in enumerate(images_list):
+            image_path = f"{folder_name}/seed_{seed}_{i}.{RES_FILE_EXTENSION}"
+            s3.upload_image_png_optimized(
+                img=image,
+                bucket=ReplaceBG.bucket_name,
+                key=image_path,
+            )
+
+
+    def _upload_non_watermark_image(self, gen_image, image_seed): # save sid image for vhash-vdr (non isolated routes), used to continue from the sid image in the future in other pipelines
+        if self.vdr_object is not None:
+            visual_id=self.vdr_object.visual_hash
+            sid_to_save = None
+            for _, seed_target, sid in self.result_name_list: 
+                if image_seed == seed_target:
+                    sid_to_save = sid.split(".")[0]
+                    bucket_name, filename_in_bucket = get_path_to_save_sid_image(visual_id=visual_id, sid=sid_to_save)
+                    _ = upload_image_to_s3(image=gen_image, bucket_name=bucket_name, filename_in_bucket=filename_in_bucket, png=True) # compression?
+                    break
+
+    # @log_time("generate_and_inpaint_thread")
+    @sentry_child_metric_operation
+    def generate_and_inpaint_thread(
+        self,
+        k8_url: str,
+        model_type: StableDiffusionInpaintAlgos,
+        orig_size_image: ImageType,
+        orig_image: ImageType,
+        fg_mask: ImageType,
+        fg_bin_mask: ImageType,
+        num_results: int,
+        seed: int,
+        params: Dict,
+        future_to_remove_bg,
+    ):
+        try:
+            replace_bg_inference = ReplaceBGInference(
+                disable_safety_checker = params["disable_safety_checker"],
+                model_type=model_type,
+                fast_inference=params["fast_inference"]
+            )
+            for i in range(num_results):
+                image_seed = seed + i * ReplaceBGInference.INSTANCE_NUMBER
+                gen_images = replace_bg_inference.start(
+                    prompt=params["prompt"],
+                    negative_prompt=params["negative_prompt"],
+                    image=orig_image,
+                    mask_image=fg_bin_mask, # maybe change to non-binary (Dvir)
+                    image_count=1,
+                    steps_num=self.steps_num,
+                    seed=image_seed,
+                    size=params["size"],
+                    fg_paste_en=params["fg_paste_en"],
+                    image_prompt_scale=self.image_prompt_scale,
+                    ref_images=self.ref_images
+                )
+
+                if len(gen_images) == 0:
+                    self._upload_empty_file(image_seed, params["folder"])
+                    continue
+
+                gen_image = gen_images[0]
+                gen_image = self._inpainting_post_process(gen_image, orig_size_image, fg_mask, params)
+                self._upload_non_watermark_image(gen_image, image_seed)
+                new_image = (add_image_watermark(gen_image) if self.watermark_flag else gen_image)
+                self._upload_images([new_image], params["prompt"], image_seed, params["folder"])
+                post_image_generation(gen_image, MODEL_VERSION, self.api_token)
+
+        except Exception as e:
+            print("generate_and_inpaint_thread", e)
+            sentry_sdk.capture_exception(e)
+            
+    def _preprocess_input_images(
+        self, orig_image: ImageType, fg_mask: ImageType, params:Dict
+    ):
+        gen_size = params["size"]
+        norm_size = params["norm_size"]
+        margin = params["margin"]
+    
+        orig_image = orig_image.resize(norm_size)
+        fg_mask = fg_mask.resize(norm_size)
+        fg_mask = invert(fg_mask)
+        margin_w, margin_h = margin
+        gen_img = Image.new("RGB", gen_size, (0, 0, 0))
+        gen_img.paste(orig_image, (margin_w, margin_h))
+        gen_mask = Image.new("L", gen_size, (255))
+        gen_mask.paste(fg_mask, (margin_w, margin_h))
+
+        return gen_img, gen_mask
+
+
+    def _crop_around_fg(
+            self, 
+            input_image:ImageType,
+            padding: List[int] = [0, 0, 0, 0]
+    ):
+        cropped_image = crop_around_object(input_image, padding)
+        cropped_mask = cropped_image.split()[-1]
+        return cropped_image, cropped_mask
+
+
+    def _create_a_placement(self, placement:Placement):
+        target_size = self.replaceBGInput.canvas_size
+        target_image, mask_image = self._create_black_image(target_size)
+        width, height = placement.x2-placement.x1, placement.y2-placement.y1
+        width_px, height_px = int(width*target_size[0]), int(height*target_size[1])
+
+        #resize crop image to bbox size
+        object_image = resize_image_by_bounding_box(self.cropped_image, (width_px, height_px))
+        object_image_mask = resize_image_by_bounding_box(self.cropped_mask, (width_px, height_px))
+        center_pt = (int((placement.x1+placement.x2)*target_size[0]/2), int((placement.y1+placement.y2)*target_size[1]/2))
+        object_width, object_height = object_image.size
+        paste_pt = (center_pt[0]-object_width//2, center_pt[1]-object_height//2)
+        target_image.paste(object_image, paste_pt, object_image_mask)
+        mask_image.paste(object_image_mask, paste_pt, object_image_mask)
+
+        return target_image, mask_image        
+
+    def _create_single_placement(self, placement_type: ReplaceBGPlacementsLocation):
+        placement = placement_type.value
+        return self._create_a_placement(placement)
+
+
+    # @log_time()
+    def _create_placements(self):
+        if self.replaceBGInput.placement_type == ReplaceBGPlacementType.ORIGINAL:
+            self.target_images = [self.orig_image]
+            self.mask_images = [self.fg_mask]
+            return 
+        
+        if self.replaceBGInput.placement_type == ReplaceBGPlacementType.MANUAL_PADDING:
+            old_size = self.orig_image.size
+            padding = self.replaceBGInput.padding_values
+            new_size = (old_size[0]+padding[0]+padding[1], old_size[1]+padding[2]+padding[3])
+            paste_loc = (padding[0], padding[2])
+            new_image = Image.new("RGB", new_size, (0, 0, 0))
+            new_image.paste(self.orig_image, paste_loc)
+            new_mask = Image.new("L", new_size, (0))
+            new_mask.paste(self.fg_mask, paste_loc)
+
+            self.target_images = [new_image]
+            self.mask_images = [new_mask]
+            return
+        
+        self.cropped_image, self.cropped_mask = self._crop_around_fg(input_image=self.fg_image)
+
+        if self.replaceBGInput.placement_type == ReplaceBGPlacementType.AUTOMATIC:
+            self.target_images, self.mask_images = [], []
+            for replacement_type in list(ReplaceBGPlacementsLocation):
+                target_image, mask_image = self._create_single_placement(replacement_type)
+                self.target_images.append(target_image)
+                self.mask_images.append(mask_image)
+
+        elif self.replaceBGInput.placement_type == ReplaceBGPlacementType.MANUAL_PLACEMENT:
+            self.target_images, self.mask_images = [], []
+            if self.replaceBGInput.manual_placement_selection is not None and len(self.replaceBGInput.manual_placement_selection)>0:
+                for placement_location in self.replaceBGInput.manual_placement_selection:
+                    target_image, mask_image = self._create_single_placement(ReplaceBGPlacementsLocation[placement_location.name])
+                    self.target_images.append(target_image)
+                    self.mask_images.append(mask_image)
+            elif self.replaceBGInput.manual_placement_location is not None and self.replaceBGInput.manual_placement_size is not None:
+                x,y = self.replaceBGInput.manual_placement_location
+                w,h = self.replaceBGInput.manual_placement_size
+                canvas_size = self.replaceBGInput.canvas_size
+                x,y,w,h = x/canvas_size[0], y/canvas_size[1], w/canvas_size[0], h/canvas_size[1]
+                placement = Placement(x, y, x+w, y+h)
+                target_image, mask_image = self._create_a_placement(placement)
+                self.target_images = [target_image]
+                self.mask_images = [mask_image]                
+
+            
+        return self.target_images, self.mask_images
+
+
+    @log_time("generate_and_inpaint")
+    def _generate_and_inpaint(
+        self, orig_image: ImageType, fg_mask: ImageType, params: Dict
+    ):
+        parallel_num = ReplaceBGInference.INSTANCE_NUMBER
+        start_seed_per_machine = []
+        for machine in range(parallel_num):
+            start_seed = params["seed"] + machine
+            start_seed_per_machine.append(start_seed)
+
+        end_seed = params["seed"] + params["num_results"]
+
+        seeds_per_machine=[]
+        for machine in range(parallel_num):
+            seeds_machine = list(range(start_seed_per_machine[machine], end_seed, parallel_num))
+            seeds_per_machine.append(seeds_machine)
+
+        norm_orig_image, fg_bin_mask = self._preprocess_input_images(
+            orig_image.convert('RGB'), fg_mask, params
+        )
+
+        future_to_sd_thread=[]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=parallel_num
+        ) as executor:
+            for machine in range(parallel_num):
+                future = executor.submit(
+                    self.generate_and_inpaint_thread,
+                    "",
+                    StableDiffusionInpaintAlgos.CONTROLNET_XL,
+                    orig_image,
+                    norm_orig_image,
+                    fg_mask,
+                    fg_bin_mask,
+                    len(seeds_per_machine[machine]),
+                    start_seed_per_machine[machine],
+                    params,
+                    None,
+                )
+                future_to_sd_thread.append(future)
+                
+            for future in concurrent.futures.as_completed(future_to_sd_thread):
+                try:
+                    data = future.result()
+                except Exception as exc:
+                    print(f'generated an exception: ', exc)
+                    raise Exception(exc)
+                
+    @staticmethod
+    def generate_seed(seed):
+        MAXINT32 = 2 ** 31 - 1
+        generation_seed = (
+            random.randint(0, MAXINT32) if seed == -1 else seed % MAXINT32
+        )
+        return generation_seed
+
+    vu_vhashes = {
+        1: "90b5eb8a6717d864",
+        2: "c9beb06a7cc2a954",
+        3: "c8e2e4f8678d34c6",
+        4: "916e04fb0fb451e9",
+        5: "94d6c366311f798c",
+        6: "d6fa79055854a6a9",
+        7: "96c7849ae9b93878",
+        8: "e6e5153d7db4804c",
+        9: "89a4f6a656722ba9",
+    }
+
+    def _set_resize_vals(self, bg_image):
+        img_size = w, h = self.img.size
+        bg_size = bg_w, bg_h = bg_image.size
+        ratios = [bg_w / w, bg_h / h]
+        scale_down_factor = min(ratios)
+        new_bg_size: ImageSizeType = ImageSizeType((
+            int(bg_w / scale_down_factor),
+            int(bg_h / scale_down_factor),
+        ))
+        return new_bg_size
+
+    def _get_max_alpha(self,vals,vals_range):
+
+        sats = []
+        for i in range(len(vals_range)-1):
+            sats+= [(vals_range[i]+vals_range[i+1])/2]
+        
+        max_alpha=255/sats[-1]
+        total = np.sum(vals)
+        for i in range(len(sats)):
+            sat = sats[i]
+
+            max_alpha = 255/sat
+            if np.sum(vals[i:])/total<0.01:
+                return max_alpha
+        
+        return max_alpha
+    
+
+    def _adapt_color(self, image: ImageType, mask:ImageType, rgb_color:tuple):
+        
+        # gen image might changed the object, hence we do rmbg again
+        # ori sends mask inverted
+        curr_mask_fg = np.array(mask)<128
+        new_mask_fg = np.array(self._remove_bg_isolated(image))>128
+        # new_mask_fg = np.array(RemoveBackgroundAlg().run_on(image))>128
+        fg = curr_mask_fg | new_mask_fg
+        mask = (fg==False)
+        
+        image = np.array(image)
+
+        if rgb_color ==(0,0,0):
+            rgb_val = [50,50,50] # We need to soften black a bit to keep the shadows
+        else:
+            rgb_val = rgb_color
+
+        img_lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+        lab_val= cv2.cvtColor(np.array([[rgb_val]]).astype(np.uint8), cv2.COLOR_RGB2LAB)[0,0]
+    
+            
+        def adjust_lightness(index):
+            mean_val = lab_val[index]
+            lightness = img_lab[:,:,index][mask] 
+            vals, bin_edges = np.histogram(lightness,bins=10)
+            ind = np.argmax(vals)
+            current_mean_val = (bin_edges[ind]+bin_edges[ind+1])/2
+            tol = 15
+            val_filtered = lightness[(lightness>=(current_mean_val - tol)) & (lightness<=(current_mean_val+lightness))]
+            current_mean_val = np.mean(val_filtered)
+            max_alpha =  self._get_max_alpha(vals,bin_edges)
+            lightness = lightness.astype(np.float32)
+            alpha = min((mean_val/current_mean_val),max_alpha)
+            lightness = lightness * alpha
+            lightness[lightness>255] = 255
+            lightness = lightness.astype(np.uint8)
+            img_lab[:,:,index][mask] = lightness
+
+        adjust_lightness(1) # A channel
+        adjust_lightness(2) # B channel
+        
+        # Place values
+        image = cv2.cvtColor(img_lab, cv2.COLOR_LAB2RGB)
+        image = Image.fromarray(image)
+        return image
+
+
+    def _plain_replace_bg(self, image, mask, params):
+        def _get_plain_color_from_prompt(prompt:str)->tuple:
+            """
+            return color name from prompt
+            """
+            prompt = prompt.lower()
+            prompt_list = prompt.replace(',',' ').split(" ")
+            remove_list = ["background", "a", "solid", "color", "of", "the", "and", "is", "#"]
+            prompt_list = [x for x in prompt_list if x not in remove_list]
+            prompt = "".join(prompt_list)
+            color_names = list(ImageColor.colormap.keys())
+            color_numbers = list(ImageColor.colormap.values())
+            # if prompt left with color word
+            if prompt in color_names:
+                return (prompt, ImageColor.getrgb(prompt))
+            
+            # if prompt left color number with or without #
+            elif f"#{prompt}" in color_numbers or prompt in color_numbers:
+                prompt = prompt.replace("#","")
+                inx = color_numbers.index(f"#{prompt}")
+                color_name = color_names[inx]
+                return (color_name, ImageColor.getrgb(color_name))
+                                    
+            else:
+                rgb_prompt = prompt.replace("#","")
+                if len(rgb_prompt)==6:                    
+                    try:
+                        rgb = tuple(int(rgb_prompt[i:i + 2], 16) for i in range(0, 6, 2))
+                        return (prompt, rgb)
+                    except:
+                        return ()
+                return ()
+        
+
+        def _create_plain_color_image(color_rgb, image, mask, params, seed):
+            bg_image = Image.new("RGB", image.size, color_rgb)
+            new_image = bg_image
+            new_image.paste(image, mask)
+            time.sleep(2)            
+            self._upload_non_watermark_image(new_image, seed)
+            new_image = (add_image_watermark(new_image) if self.watermark_flag else new_image)
+            self._upload_images([new_image], "", seed, params["folder"])
+
+        def _create_generated_color_image(bg_color, orig_image, fg_mask, params, seed, num_bg_images):            
+            stable_diffusion_pipeline = ReplaceBGInference(
+                disable_safety_checker = params["disable_safety_checker"],
+            )            
+            # We change params so that we will generate a 512,5125 images 
+            # This works much better in solid background mode
+            params = params.copy()
+            orig_normalized_size = params["norm_size"]
+            margin_w = (params['size'][0] - orig_normalized_size[0]) // 2
+            margin_h = (params['size'][1] - orig_normalized_size[1]) // 2
+            margin = (margin_w, margin_h)
+            params["margin"] = margin
+            norm_orig_image, norm_orig_bg_mask = self._preprocess_input_images(orig_image, fg_mask, params)  
+            initial_green_bg_prompt = params.get("initial_green_bg_prompt", DEFAULT_INITIAL_GREEN_BG_PROMPT)
+            
+            def _start_stable_diffusion_pipeline(seed):
+                gen_images = stable_diffusion_pipeline.start(
+                        prompt=initial_green_bg_prompt,
+                        image=norm_orig_image,
+                        mask_image=norm_orig_bg_mask,
+                        image_count=1,
+                        steps_num=self.steps_num,
+                        seed=seed,
+                        size=params["size"],
+                        fg_paste_en=params["fg_paste_en"],
+                    )
+
+                if len(gen_images) == 0:
+                    self._upload_empty_file(seed, params["folder"])
+                else:
+                    gen_image = gen_images[0]
+                    
+                    gen_image = self._inpainting_post_process(gen_image, orig_image, fg_mask, params, gen_mask=norm_orig_bg_mask, bg_color=bg_color)
+
+                    # Place foreground
+                    if params["fg_paste_en"]:
+                        gen_image.paste(orig_image, fg_mask)
+
+                    self._upload_non_watermark_image(gen_image, seed)
+                    gen_image = (add_image_watermark(gen_image) if self.watermark_flag else gen_image)
+                    self._upload_images([gen_image], "", seed, params["folder"])
+
+            # Set a green generated background
+            parallel_num = ReplaceBGInference.INSTANCE_NUMBER
+            future_to_sd_thread=[]
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=parallel_num
+            ) as executor:
+                for i in range(num_bg_images):
+                    final_seed = seed 
+                    future = executor.submit(_start_stable_diffusion_pipeline, final_seed)
+                    seed+=1
+                    future_to_sd_thread.append(future)
+                for future in concurrent.futures.as_completed(future_to_sd_thread):
+                    try:
+                        data = future.result()
+                    except Exception as exc:
+                        print(f'generated an exception: ', exc)
+                        raise Exception(exc)
+            
+        ### wanted format: a prompt with a description of known color or #RGB
+        bg_color = _get_plain_color_from_prompt(self.replaceBGInput.bg_prompt)
+        if bg_color:
+            color_name, color_rgb = bg_color
+            num_results = params["num_results"]
+            # Threads in order to not block the main thread
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+
+                # plain color image
+                if num_results>=1:
+                    seed = params["seed"]
+                    params["seed"]+=1
+                    params["num_results"]-=1
+                    executor.submit(_create_plain_color_image, color_rgb, image, mask, params, seed)
+
+                seed = params['seed']
+
+                # Generated bg images with a specialized prompt
+                num_bg_images = 0 
+                if num_results>=2:
+                    num_bg_images+=1
+                    params["seed"]+=1
+                    params["num_results"]-=1
+                    
+                if num_results>=3:
+                    num_bg_images+=1
+                    params["seed"]+=1
+                    params["num_results"]-=1
+                
+                executor.submit(_create_generated_color_image, color_rgb, image, mask, params, seed, num_bg_images=num_bg_images)
+                
+            return True
+        else:
+            return False
+
+    @sentry_child_metric_operation    
+    def _refine_prompt(self, prompt, new_prompt_res):
+
+        fg_image = Image.new("RGB", self.fg_image.size, (255, 255, 255))
+        fg_image.paste(self.fg_image, mask=self.fg_image.split()[3])
+        fg_image = fg_image.convert('RGB')
+
+        try:
+            new_prompt = replace_bg_prompt_refinement(prompt, fg_image, self.orig_image)
+            if verify_generate_query(new_prompt) and self.replaceBGInput.nsfw_limit:
+                new_prompt_res.append(new_prompt)
+            else:
+                new_prompt_res.append(prompt)
+        except Exception as e:
+            new_prompt_res.append(prompt)
+            sentry_sdk.capture_exception(e, level="warning")
+
+    @log_time()
+    def refine_prompt_with_timeout(self, prompt, timeout):
+        new_prompt = []  # A flag to indicate completion
+        thread = threading.Thread(target=self._refine_prompt, args=(prompt, new_prompt))
+        thread.start()
+        thread.join(timeout)  # Wait for the specified timeout
+
+        try:
+            return_prompt = new_prompt[0]
+        except Exception as e:
+            e.args = ("timeout on LLAVA inference for refine prompt",) + e.args
+            sentry_sdk.capture_exception(e, level="warning")
+            return_prompt = prompt # Task did not complete within timeout
+        
+        return return_prompt
+
+    def extract_ref_images(self)->List[Image.Image]:
+        ref_images = []
+        if self.replaceBGInput.ref_image_urls:
+            if not isinstance(self.replaceBGInput.ref_image_urls, list):
+                self.replaceBGInput.ref_image_urls = [self.replaceBGInput.ref_image_urls]
+            for ref_image_url in self.replaceBGInput.ref_image_urls:
+                ref_image = get_image_from_input(image_url = ref_image_url)
+                ref_image = ref_image.convert("RGB").resize(REF_IMAGE_SIZE)
+                ref_images.append(ref_image)
+
+        elif self.replaceBGInput.ref_image_files:
+            if not isinstance(self.replaceBGInput.ref_image_files, list):
+                self.replaceBGInput.ref_image_files = [self.replaceBGInput.ref_image_files]
+            for ref_image_file in self.replaceBGInput.ref_image_files:
+                ref_image = get_image_from_input(file = ref_image_file)
+                ref_image = ref_image.convert("RGB").resize(REF_IMAGE_SIZE)
+                ref_images.append(ref_image)
+        return ref_images
+
+    # @log_time("replaceBG_start")
+    @sentry_child_metric_operation
+    @log_time("replaceBG_pipeline")
+    def start(self,
+              replaceBGInput: ReplaceBGInputConfig,
+              ) -> None:
+        replaceBGInput.bg_prompt = replaceBGInput.bg_prompt if replaceBGInput.bg_prompt else " "
+        self.replaceBGInput = replaceBGInput
+        prompt: str = replaceBGInput.bg_prompt  
+        refine_prompt: bool = replaceBGInput.refine_prompt
+        initial_green_bg_prompt: str = replaceBGInput.initial_green_bg_prompt
+        negative_prompt: str = replaceBGInput.negative_prompt
+        num_results: int = replaceBGInput.num_results
+        self.steps_num = replaceBGInput.steps_num
+        seed: int = replaceBGInput.seed
+        result_name_list: list = replaceBGInput.result_name_list
+        disable_safety = replaceBGInput.disable_safety
+        allow_solid_bg = replaceBGInput.allow_solid_bg
+
+        self.result_name_list = result_name_list
+        orig_image: ImageType = self.img
+        self.orig_image = orig_image
+        self.ref_images = self.extract_ref_images()
+        self.image_prompt_scale = replaceBGInput.image_prompt_scale
+
+        self.fg_image, self.fg_mask = self._remove_bg(replaceBGInput.rmbg_model_version)
+        
+        folder = ReplaceBG.get_target_folder(self.vhash_or_uuid, prompt, self.session_uid)
+        # seed = ReplaceBG.generate_seed(seed) # DO NOT PUSH LIKE THIS TO DEV!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        fg_paste_en = False if prompt and prompt[0] == "*" else True
+        prompt = prompt if fg_paste_en else prompt[1:]
+        prompt = avoid_celeb_names(prompt)
+
+        self._create_placements()
+        gen_size, orig_normalized_size, margin = self._set_gen_image_size(self.target_images[0])
+
+        params = {
+            "prompt": prompt,
+            "initial_green_bg_prompt": initial_green_bg_prompt,
+            "negative_prompt": negative_prompt,
+            "num_results": num_results,
+            "seed": seed,
+            "size": gen_size,
+            "norm_size": orig_normalized_size,
+            "margin": margin,
+            "folder": folder,
+            "fg_paste_en": fg_paste_en,
+            "disable_safety_checker": disable_safety,
+            "fast_inference": replaceBGInput.fast
+        }
+
+        if refine_prompt:
+            timeout_secs = 5
+            params["prompt"] = self.refine_prompt_with_timeout(prompt, timeout_secs)
+
+        for image, mask in zip(self.target_images, self.mask_images):
+            
+            if allow_solid_bg:
+                self._plain_replace_bg(image, mask, params)                                
+            
+            self._generate_and_inpaint(image, mask, params)
+            params["seed"] += params['num_results']
+
+            # Restore num results for next iters
+            params['num_results'] = num_results
+
+        return
+
+
+    @staticmethod
+    def get_image_path(folder_name: str, seed: int):
+        return f"{folder_name}/seed_{seed}.{RES_FILE_EXTENSION}"
+
+
+    @staticmethod
+    def get_target_folder(
+         vhash_or_uuid: str, prompt: str, session_uid: str = ""
+    ):
+        prompt_underscore = prompt.replace(" ", "_").replace(",", "") if prompt else "_"
+        return (
+            f"api/replace_bg_results/{vhash_or_uuid}_{prompt_underscore}_{session_uid}"[:FOLDER_SIZE_LIMIT]
+        )
+
+
+    @staticmethod
+    def get_result_name_list(
+        session_uid: str, 
+        vhash_or_uuid: str, 
+        prompt: str, 
+        seed: int, 
+        num_result: int,
+        placement_type: ReplaceBGPlacementType = ReplaceBGPlacementType.ORIGINAL,
+        manual_placement_selection: List[ReplaceBGPlacementsLocation] = [],
+    ) -> List[Tuple]:
+
+        generation_seed = ReplaceBG.generate_seed(seed)
+        folder_name = ReplaceBG.get_target_folder(vhash_or_uuid, prompt, session_uid)
+
+        # Placements modes
+        multiply_factor = 1
+        placement_type_enum = placement_type
+        if placement_type_enum == ReplaceBGPlacementType.MANUAL_PLACEMENT:
+            if manual_placement_selection:
+                multiply_factor = len(manual_placement_selection)
+        elif placement_type_enum == ReplaceBGPlacementType.AUTOMATIC:
+            multiply_factor = len(ReplaceBGPlacementsLocation)
+
+        num_result = num_result * multiply_factor
+        result = []
+        for i in range(num_result):
+            image_seed = generation_seed + i
+            file_name = ReplaceBG.get_image_path(folder_name, image_seed)
+            user_url = change_url_to_presigned(
+                bucket_name=ReplaceBG.bucket_name, file_name=file_name
+            )
+            sid = f"{str(uuid.uuid1())}.{RES_FILE_EXTENSION}"
+            result.append((user_url, image_seed, sid))
+
+        return result
+
+
+    # TODO add into pydantic (top of this file)
+    @staticmethod
+    def validate_input_params(placement_type: ReplaceBGPlacementType, manual_placement_selection, canvas_size, padding_values):
+        if placement_type not in [member for member in ReplaceBGPlacementType]:
+            raise BadRequest(f"placement_type {placement_type} is not valid")
+        if placement_type == ReplaceBGPlacementType.ORIGINAL:
+            return True
+        if placement_type == ReplaceBGPlacementType.MANUAL_PLACEMENT:
+            # if not manual_placement_selection and not ():
+            #     raise BadRequest("manual_placement_selection is empty")
+            # if manual_placement_selection.lower() not in [member.value for member in ReplaceBGPlacements]:
+            #     pass
+            if manual_placement_selection is not None:
+                for placement in manual_placement_selection:
+                    if placement not in [member for member in ReplaceBGPlacements]:
+                        raise ValueError(f"placement {placement} is not valid")
+        if len(canvas_size) != 2:
+            raise BadRequest(description="canvas_size must be a tuple of length 2")
+        for size in canvas_size:
+            if not isinstance(size, int) or size <= 0:
+                raise BadRequest(description="canvas_size must be positive integers")
+
+        if len(padding_values) != 4 and (padding_values) != 1:
+            raise BadRequest(description="padding_values must be a list of length 4")
+        
+        return True
+
+
+    def upload_image_for_debug_if_needed(
+        self,
+        img: Union[List[ImageType], ImageType],
+        key: str,
+        config: PipelineApiInput,
+        level: VisualLogLevel = VisualLogLevel.VERBOSE,
+    ):
+        from typing import List, Optional, cast
+        from connectors.models.image_doc import ImageDoc        
+        from datetime import datetime
+        import pytz
+        if self.visual_dump:
+            if img is None:
+                return None
+            img_to_upload: Optional[ImageType] = None
+            if type(img) == List[ImageType] or type(img) == list:
+                if len(img) == 0:
+                    return
+                img = cast(List[ImageType], img)
+                for i in range(len(img)):
+                    if type(img[i]) != Image.Image:
+                        img[i] = Image.fromarray(img[i])
+                first = img[0]
+                for i in img:
+                    if i is None:
+                        return None
+                    if i.size != first.size:
+                        i = i.resize(first.size)
+                img_to_upload = self.get_concat_h(images=img)
+            elif type(img) == ImageType:
+                img = cast(ImageType, img)
+                img_to_upload = img
+            else:
+                print(f"{type(img)} is not supported for debug upload")
+                return None
+            init_time = datetime.now(pytz.timezone("Israel")).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )                
+            image_doc: ImageDoc = ImageDoc(
+                img=img_to_upload,
+                source="briengine",
+                labels=[],
+                visual_hash=config.visual_hash,
+                project="",
+                path=f"{init_time}_{config.visual_hash}",
+                display_name=f"{config.visual_hash}_{key}",                
+            )            
+            research_db.insert_image_into_research(
+                image_doc=image_doc,
+                img = img_to_upload,
+                overwrite_by_display_name=False,
+                top_level_folder_name="engine_visual_debug",
+            )
+
+
+    def upload_debug_data(self, input: PipelineApiInput,):
+        from connectors.interfaces.mongo import MongoField
+        if self.textual_dump:
+
+            update_filter = {MongoField.VISUAL_HASH.value: input.visual_hash}
+            command = {"$push": {"text_debug": str(input.__dict__)}}
+            # command_remove = {"$pull": {"text_debug": "test_word1"}}
+
+            research_db.update_doc(
+                collection=research_db.collection.mongo_collection,
+                filter = update_filter,
+                update_command=command
+            )
+            # vhash_doc = research_db.get_doc_by_query(
+            #         collection=research_db.collection.mongo_collection,
+            #         query = update_filter
+            # )
